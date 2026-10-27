@@ -6,18 +6,24 @@ __all__ = ["_apply_triton_heuristics_patches"]
 # pylint:disable=W0613,W0122,W0622
 from typing import List, Optional
 import copy
+import os
 
 import torch
 import torch._inductor.runtime
-from torch._inductor.runtime.runtime_utils import get_first_attr
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.triton_bundler import TritonBundler
+from torch._inductor.runtime.runtime_utils import (
+    get_first_attr,
+    triton_hash_to_path_key,
+)
 from torch._inductor.runtime.triton_heuristics import (
     log,
     unique_configs,
     hash_configs,
-    AutotuneCache,
     CachingAutotuner,
     DebugAutotuner,
 )
+from torch._inductor.runtime.autotune_cache import AutotuneCache
 import torch._inductor.runtime.triton_heuristics
 
 
@@ -56,7 +62,7 @@ class MUSACachingAutotuner(CachingAutotuner):
         # cuda and hip configs are removed
         compile_meta = copy.deepcopy(self.triton_meta)
         for k, v in cfg.kwargs.items():
-            compile_meta["constants"][self.fn.arg_names.index(k)] = v
+            compile_meta["constants"][k] = v
         compile_meta["num_warps"] = cfg.num_warps
         compile_meta["num_stages"] = cfg.num_stages
         compile_meta["debug"] = self.inductor_meta.get("assert_indirect_indexing", True)
@@ -64,6 +70,11 @@ class MUSACachingAutotuner(CachingAutotuner):
         # device type will be "musa" rather than "cuda" here
         compile_meta["device_type"] = self.device_props.type
         compile_meta["cc"] = self.device_props.cc
+
+        if self.device_props.type == "cpu":
+            triton_helpers.set_driver_to_cpu()
+        else:
+            triton_helpers.set_driver_to_gpu()
 
         if ASTSource:
             compile_args = (
@@ -91,6 +102,7 @@ class MUSACachingAutotuner(CachingAutotuner):
                 "num_warps": compile_meta["num_warps"],
                 "num_stages": compile_meta["num_stages"],
                 "debug": compile_meta["debug"],
+                "sanitize_overflow": False,
             }
             compile_kwargs = {
                 "target": target,
@@ -101,10 +113,12 @@ class MUSACachingAutotuner(CachingAutotuner):
             compile_kwargs = compile_meta
 
         if warm_cache_only:
-            return (
-                triton.compile(*compile_args, **compile_kwargs),
-                None,
+            binary = triton.compile(*compile_args, **compile_kwargs)
+            launcher = None
+            TritonBundler.put(
+                triton_hash_to_path_key(binary.hash), self.triton_meta.get("device", 0)
             )
+            return binary, launcher
 
         # importing from torch is safe now that precompile has returned
         from torch._dynamo.device_interface import DeviceGuard
@@ -128,13 +142,41 @@ class MUSACachingAutotuner(CachingAutotuner):
                 raise
             binary._init_handles()
 
+        """
+        https://github.com/pytorch/pytorch/issues/115344
+
+        self.fn.constexprs doesn't properly deal with None args, so when we filter out
+        an arg in UserDefinedTritonKernel.codegen, we need to filter it here as well.
+        We also don't want to modify self.fn.
+
+        We know that we removed something from the signature if:
+            1. It's in compile_meta["constants"]
+            2. It isn't a constant we already know about
+                Note: The value of interest has already been added to compile_meta['constants'],
+                    so we use self.fn.constexprs instead.
+            3. It isn't in the compile_meta signature
+        """
+        known_constants = {
+            arg for i, arg in enumerate(self.fn.arg_names) if i in self.fn.constexprs
+        }
+        none_args = {
+            k
+            for k, v in compile_meta["constants"].items()
+            if v is None and k not in known_constants
+        }
+        none_args = none_args.difference(set(compile_meta["signature"].keys()))
+
         call_args = [
             arg
             for i, arg in enumerate(self.fn.arg_names)
-            if i not in self.fn.constexprs
+            if i not in self.fn.constexprs and arg not in none_args
         ]
-        def_args = [name for name in self.fn.arg_names if name not in cfg.kwargs]
 
+        def_args = [
+            name
+            for name in self.fn.arg_names
+            if name not in cfg.kwargs and name not in none_args
+        ]
         binary_shared = (
             binary.shared if hasattr(binary, "shared") else binary.metadata.shared
         )
@@ -315,6 +357,10 @@ class MUSACachingAutotuner(CachingAutotuner):
             launcher.fn = self.fn
             launcher.bin = binary
 
+        TritonBundler.put(
+            triton_hash_to_path_key(binary.hash), self.triton_meta.get("device", 0)
+        )
+
         return binary, launcher
 
     def save_gpu_kernel(self, grid, stream, launcher):
@@ -389,6 +435,7 @@ def cached_autotune(
         not disabled
         and filename is not None
         and (len(configs) > 1 or inductor_meta.get("coordinate_descent_tuning"))
+        and not os.environ.get("TRITON_INTERPRET", "0") == "1"
     ):
         configs_hash = hash_configs(configs)
 
@@ -402,6 +449,14 @@ def cached_autotune(
             log.debug("autotune caching is disabled by config.force_disable_caches")
 
     mutated_arg_names = inductor_meta.pop("mutated_arg_names", ())
+    optimize_mem = inductor_meta.pop("optimize_mem", True)
+
+    if "restore_value" in triton_meta:
+        mutated_arg_names += triton_meta.pop("restore_value")
+
+    reset_to_zero_arg_names: List[str] = []
+    if "reset_to_zero" in triton_meta:
+        reset_to_zero_arg_names.extend(triton_meta.pop("reset_to_zero"))
 
     def decorator(fn):
         # Remove XBLOCK from config if it's not a function argument.
@@ -428,10 +483,13 @@ def cached_autotune(
                 configs=configs,
                 save_cache_hook=autotune_cache and autotune_cache.save,
                 mutated_arg_names=mutated_arg_names,
+                reset_to_zero_arg_names=reset_to_zero_arg_names,
+                optimize_mem=optimize_mem,
                 heuristic_type=heuristic_type,
                 size_hints=size_hints,
                 custom_kernel=custom_kernel,
                 filename=filename,
+                with_bandwidth_info=True,
             )
         return MUSACachingAutotuner(
             fn,
@@ -440,6 +498,8 @@ def cached_autotune(
             configs=configs,
             save_cache_hook=autotune_cache and autotune_cache.save,
             mutated_arg_names=mutated_arg_names,
+            reset_to_zero_arg_names=reset_to_zero_arg_names,
+            optimize_mem=optimize_mem,
             heuristic_type=heuristic_type,
             size_hints=size_hints,
             custom_kernel=custom_kernel,

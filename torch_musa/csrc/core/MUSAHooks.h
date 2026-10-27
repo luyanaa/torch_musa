@@ -31,6 +31,9 @@ struct MUSAHooks : MUSAHooksInterface {
   const Generator& getDefaultMUSAGenerator(
       DeviceIndex device_index) const override;
 
+  Generator getNewGenerator(
+      DeviceIndex device_index = -1) const override;
+
   Device getDeviceFromPtr(void* data) const override;
 
   void resizeMUSABytes(const Storage& storage, size_t newsize) const override;

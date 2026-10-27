@@ -98,6 +98,10 @@ struct MUSAGuardImpl final : public c10::impl::DeviceGuardImplInterface {
     musa_stream.synchronize();
   }
 
+  void synchronizeDevice(const DeviceIndex /*device_index*/) const override {
+    c10::musa::Synchronize();
+  }
+
   void createEvent(musaEvent_t* musa_event, const EventFlag flag) const {
     auto musa_flag = musaEventDefault;
     switch (flag) {

@@ -70,6 +70,7 @@ class MusaInterface(DeviceInterface):
     get_raw_stream = staticmethod(get_musa_stream)
     exchange_device = staticmethod(torch.musa._exchange_device)
     maybe_exchange_device = staticmethod(torch.musa._maybe_exchange_device)
+    memory_allocated = staticmethod(torch.musa.memory_allocated)
 
     # Can be mock patched by @patch decorator.
     @staticmethod
