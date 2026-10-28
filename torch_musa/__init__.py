@@ -137,6 +137,8 @@ from .core.ops import *
 
 from .musa_graph import *
 
+from .flash_attention_s80 import flash_attention_s80, flash_attention_s80_reference
+
 from .core import mccl
 
 # A hack to get `torch.backends.mudnn` functions/attributes. This allows users to use cudnn
