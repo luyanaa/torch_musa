@@ -217,19 +217,14 @@ Tensor ClampMin(const Tensor& self, const Scalar& min) {
 Tensor& ClampMin_(Tensor& self, const Scalar& min) {
   MUSA_TENSOR_TYPE_CHECK(self);
   const c10::musa::MUSAGuard device_guard(self.device());
-  Tensor output = at::empty_like(
-      self,
-      c10::TensorOptions(self.suggest_memory_format())
-          .dtype(self.scalar_type()));
   ClampScalarCall(
       __func__,
-      output,
+      self,
       self,
       true,
       c10::optional<Scalar>(min),
       false,
       c10::optional<Scalar>());
-  self.copy_(output);
   return self;
 }
 
@@ -274,19 +269,14 @@ Tensor ClampMax(const Tensor& self, const Scalar& max) {
 Tensor& ClampMax_(Tensor& self, const Scalar& max) {
   MUSA_TENSOR_TYPE_CHECK(self);
   const c10::musa::MUSAGuard device_guard(self.device());
-  Tensor output = at::empty_like(
-      self,
-      c10::TensorOptions(self.suggest_memory_format())
-          .dtype(self.scalar_type()));
   ClampScalarCall(
       __func__,
-      output,
+      self,
       self,
       false,
       c10::optional<Scalar>(),
       true,
       c10::optional<Scalar>(max));
-  self.copy_(output);
   return self;
 }
 

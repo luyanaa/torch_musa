@@ -630,7 +630,14 @@ at::Tensor HardTanh(
     const at::Scalar& min_val,
     const at::Scalar& max_val) {
   c10::musa::MUSAGuard device_guard(self.device());
-  return at::native::hardtanh(self, min_val, max_val);
+  return Unary(
+      "hardtanh",
+      self,
+      [&](::musa::dnn::Unary& op) {
+        CHECK_MUDNN_STATUS(op.SetAlpha(min_val.to<double>()), "SetAlpha");
+        CHECK_MUDNN_STATUS(op.SetBeta(max_val.to<double>()), "SetBeta");
+        CHECK_MUDNN_STATUS(op.SetMode(UNARY_MODE::CLIP), "SetMode");
+      });
 }
 
 at::Tensor& HardTanh_(
@@ -638,7 +645,15 @@ at::Tensor& HardTanh_(
     const at::Scalar& min_val,
     const at::Scalar& max_val) {
   c10::musa::MUSAGuard device_guard(self.device());
-  return at::native::hardtanh_(self, min_val, max_val);
+  Unary_(
+      "hardtanh_",
+      self,
+      [&](::musa::dnn::Unary& op) {
+        CHECK_MUDNN_STATUS(op.SetAlpha(min_val.to<double>()), "SetAlpha");
+        CHECK_MUDNN_STATUS(op.SetBeta(max_val.to<double>()), "SetBeta");
+        CHECK_MUDNN_STATUS(op.SetMode(UNARY_MODE::CLIP), "SetMode");
+      });
+  return self;
 }
 
 at::Tensor& HardTanhOut(
@@ -647,7 +662,17 @@ at::Tensor& HardTanhOut(
     const at::Scalar& max_val,
     at::Tensor& out) {
   c10::musa::MUSAGuard device_guard(self.device());
-  return at::native::hardtanh_out(self, min_val, max_val, out);
+  out.resize_as_(self);
+  UnaryOut(
+      "hardtanh.out",
+      out,
+      self,
+      [&](::musa::dnn::Unary& op) {
+        CHECK_MUDNN_STATUS(op.SetAlpha(min_val.to<double>()), "SetAlpha");
+        CHECK_MUDNN_STATUS(op.SetBeta(max_val.to<double>()), "SetBeta");
+        CHECK_MUDNN_STATUS(op.SetMode(UNARY_MODE::CLIP), "SetMode");
+      });
+  return out;
 }
 
 at::Tensor HardTanhBackward(

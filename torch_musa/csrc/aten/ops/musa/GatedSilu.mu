@@ -14,6 +14,7 @@ namespace at {
 namespace musa {
 
 #define MAX_THREADS 1024
+#define VEC_SIZE 4
 
 template <typename T>
 __device__ __forceinline__ T silu(const T& x) {
@@ -39,11 +40,42 @@ __global__ void gated_silu_kernel(
   out_ptr[cur_element_idx] = silu(x) * y;
 }
 
+// Vectorized kernel for better memory bandwidth
+template <typename T>
+__global__ void gated_silu_kernel_vec4(
+    T* out_ptr,
+    const T* input_ptr,
+    const int hidden_size,
+    const int element_num) {
+  const int vec_element_idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
+  if (vec_element_idx >= element_num) {
+    return;
+  }
+
+  const int batch_idx = vec_element_idx / hidden_size;
+  const int offset_in_batch = vec_element_idx % hidden_size;
+
+  // Process up to VEC_SIZE elements
+  #pragma unroll
+  for (int i = 0; i < VEC_SIZE && (vec_element_idx + i) < element_num; ++i) {
+    const int cur_idx = vec_element_idx + i;
+    const int cur_batch = cur_idx / hidden_size;
+    const int cur_offset = cur_idx % hidden_size;
+    const int input_x_idx = cur_batch * 2 * hidden_size + cur_offset;
+    const int input_y_idx = input_x_idx + hidden_size;
+
+    const T x = __ldg(&input_ptr[input_x_idx]);
+    const T y = __ldg(&input_ptr[input_y_idx]);
+    out_ptr[cur_idx] = silu(x) * y;
+  }
+}
+
 void gated_silu_output(const at::Tensor& input, at::Tensor& out) {
   TORCH_CHECK(
       (input.scalar_type() == at::ScalarType::Float ||
-       input.scalar_type() == at::ScalarType::Half),
-      "Dtype of input tensor of gated silu only support fp32 / fp16, but now it is ",
+       input.scalar_type() == at::ScalarType::Half ||
+       input.scalar_type() == at::ScalarType::BFloat16),
+      "Dtype of input tensor of gated silu only support fp32 / fp16 / bf16, but now it is ",
       input.scalar_type());
   TORCH_CHECK(
       input.dim() > 1,
@@ -60,20 +92,38 @@ void gated_silu_output(const at::Tensor& input, at::Tensor& out) {
   int cur_device = -1;
   C10_MUSA_CHECK(musaGetDevice(&cur_device));
 
-  size_t block_num = (element_num - 1) / MAX_THREADS + 1;
-  dim3 grid(block_num);
-  dim3 block(MAX_THREADS);
-
   const musaStream_t stream = c10::musa::getCurrentMUSAStream(cur_device);
-  AT_DISPATCH_ALL_MTGPU_TYPES_AND_HALF(
-      input.scalar_type(), "gated_silu_kernel", [&] {
-        gated_silu_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            out.data_ptr<scalar_t>(),
-            input.data_ptr<scalar_t>(),
-            hidden_size,
-            element_num);
-        C10_MUSA_KERNEL_LAUNCH_CHECK();
-      });
+
+  // Use vectorized kernel when element_num is large enough and divisible by VEC_SIZE
+  bool use_vec = (element_num >= VEC_SIZE * MAX_THREADS) && (element_num % VEC_SIZE == 0);
+
+  if (use_vec) {
+    size_t block_num = (element_num / VEC_SIZE - 1) / MAX_THREADS + 1;
+    dim3 grid(block_num);
+    dim3 block(MAX_THREADS);
+    AT_DISPATCH_ALL_MTGPU_TYPES_AND_HALF(
+        input.scalar_type(), "gated_silu_kernel_vec4", [&] {
+          gated_silu_kernel_vec4<scalar_t><<<grid, block, 0, stream>>>(
+              out.data_ptr<scalar_t>(),
+              input.data_ptr<scalar_t>(),
+              hidden_size,
+              element_num);
+          C10_MUSA_KERNEL_LAUNCH_CHECK();
+        });
+  } else {
+    size_t block_num = (element_num - 1) / MAX_THREADS + 1;
+    dim3 grid(block_num);
+    dim3 block(MAX_THREADS);
+    AT_DISPATCH_ALL_MTGPU_TYPES_AND_HALF(
+        input.scalar_type(), "gated_silu_kernel", [&] {
+          gated_silu_kernel<scalar_t><<<grid, block, 0, stream>>>(
+              out.data_ptr<scalar_t>(),
+              input.data_ptr<scalar_t>(),
+              hidden_size,
+              element_num);
+          C10_MUSA_KERNEL_LAUNCH_CHECK();
+        });
+  }
 }
 
 at::Tensor GatedSilu(const at::Tensor& input) {
