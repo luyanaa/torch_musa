@@ -120,6 +120,7 @@ from .core import _lazy_init as _lazy_init_mod
 _lazy_init = _lazy_init_mod._lazy_init
 _is_in_bad_fork = _lazy_init_mod._is_in_bad_fork
 is_initialized = _lazy_init_mod.is_initialized
+musart = _lazy_init_mod.musart
 
 
 def __getattr__(name):

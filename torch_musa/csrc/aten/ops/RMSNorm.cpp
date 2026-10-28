@@ -167,7 +167,7 @@ std::tuple<Tensor&, Tensor&> FusedRMSNormForwardOut(
   CheckDType("input", input_dtype, "output", output, "FusedRMSNormForwardOut");
 
   const c10::musa::MUSAGuard device_guard(input_device);
-  const Tensor contig_input = (input.dim() == 2 && input.stride(1) == 1)
+  const Tensor contig_input = input.is_contiguous()
       ? input
       : FormatContiguous(input, MemoryFormat::Contiguous);
   const auto contig_gamma = weight.defined()
@@ -238,7 +238,7 @@ std::tuple<Tensor, Tensor> FusedRMSNormForward(
   CheckDType("input", input_dtype, "weight", weight, "FusedRMSNormForwardOut");
 
   const c10::musa::MUSAGuard device_guard(input_device);
-  const Tensor contig_input = (input.dim() == 2 && input.stride(1) == 1)
+  const Tensor contig_input = input.is_contiguous()
       ? input
       : FormatContiguous(input, MemoryFormat::Contiguous);
   const auto contig_gamma = weight.defined()
