@@ -631,7 +631,8 @@ at::Tensor HardTanh(
     const at::Scalar& max_val) {
   c10::musa::MUSAGuard device_guard(self.device());
   if (!(self.scalar_type() == at::ScalarType::Float ||
-        self.scalar_type() == at::ScalarType::Half)) {
+        self.scalar_type() == at::ScalarType::Half) ||
+      !self.is_contiguous()) {
     return at::native::hardtanh(self, min_val, max_val);
   }
   return Unary(
@@ -650,7 +651,8 @@ at::Tensor& HardTanh_(
     const at::Scalar& max_val) {
   c10::musa::MUSAGuard device_guard(self.device());
   if (!(self.scalar_type() == at::ScalarType::Float ||
-        self.scalar_type() == at::ScalarType::Half)) {
+        self.scalar_type() == at::ScalarType::Half) ||
+      !self.is_contiguous()) {
     return at::native::hardtanh_(self, min_val, max_val);
   }
   Unary_(
@@ -671,7 +673,8 @@ at::Tensor& HardTanhOut(
     at::Tensor& out) {
   c10::musa::MUSAGuard device_guard(self.device());
   if (!(self.scalar_type() == at::ScalarType::Float ||
-        self.scalar_type() == at::ScalarType::Half)) {
+        self.scalar_type() == at::ScalarType::Half) ||
+      !self.is_contiguous()) {
     return at::native::hardtanh_out(self, min_val, max_val, out);
   }
   out.resize_as_(self);
