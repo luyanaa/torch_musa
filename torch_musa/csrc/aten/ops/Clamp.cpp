@@ -217,14 +217,27 @@ Tensor ClampMin(const Tensor& self, const Scalar& min) {
 Tensor& ClampMin_(Tensor& self, const Scalar& min) {
   MUSA_TENSOR_TYPE_CHECK(self);
   const c10::musa::MUSAGuard device_guard(self.device());
-  ClampScalarCall(
-      __func__,
-      self,
-      self,
-      true,
-      c10::optional<Scalar>(min),
-      false,
-      c10::optional<Scalar>());
+  if (self.is_contiguous()) {
+    ClampScalarCall(
+        __func__,
+        self,
+        self,
+        true,
+        c10::optional<Scalar>(min),
+        false,
+        c10::optional<Scalar>());
+  } else {
+    Tensor temp = at::empty_like(self, self.options().memory_format(at::MemoryFormat::Contiguous));
+    ClampScalarCall(
+        __func__,
+        temp,
+        self,
+        true,
+        c10::optional<Scalar>(min),
+        false,
+        c10::optional<Scalar>());
+    self.copy_(temp);
+  }
   return self;
 }
 
@@ -269,14 +282,27 @@ Tensor ClampMax(const Tensor& self, const Scalar& max) {
 Tensor& ClampMax_(Tensor& self, const Scalar& max) {
   MUSA_TENSOR_TYPE_CHECK(self);
   const c10::musa::MUSAGuard device_guard(self.device());
-  ClampScalarCall(
-      __func__,
-      self,
-      self,
-      false,
-      c10::optional<Scalar>(),
-      true,
-      c10::optional<Scalar>(max));
+  if (self.is_contiguous()) {
+    ClampScalarCall(
+        __func__,
+        self,
+        self,
+        false,
+        c10::optional<Scalar>(),
+        true,
+        c10::optional<Scalar>(max));
+  } else {
+    Tensor temp = at::empty_like(self, self.options().memory_format(at::MemoryFormat::Contiguous));
+    ClampScalarCall(
+        __func__,
+        temp,
+        self,
+        false,
+        c10::optional<Scalar>(),
+        true,
+        c10::optional<Scalar>(max));
+    self.copy_(temp);
+  }
   return self;
 }
 

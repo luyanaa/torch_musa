@@ -965,6 +965,9 @@ Tensor MaxAllCall(const Tensor& self, ::musa::dnn::Reduce::Mode m) {
 
 Tensor MaxAll(const Tensor& self) {
   c10::musa::MUSAGuard device_guard(self.device());
+  if (self.scalar_type() == ScalarType::Double) {
+    return at::max(self.to("cpu")).to("musa");
+  }
   return MaxAllCall(self, ::musa::dnn::Reduce::Mode::MAX);
 }
 
@@ -1156,6 +1159,9 @@ Tensor MinAllCall(const Tensor& self, ::musa::dnn::Reduce::Mode m) {
 
 Tensor MinAll(const Tensor& self) {
   c10::musa::MUSAGuard device_guard(self.device());
+  if (self.scalar_type() == ScalarType::Double) {
+    return at::min(self.to("cpu")).to("musa");
+  }
   return MinAllCall(self, ::musa::dnn::Reduce::Mode::MIN);
 }
 

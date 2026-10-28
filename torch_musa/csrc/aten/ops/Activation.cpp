@@ -630,6 +630,10 @@ at::Tensor HardTanh(
     const at::Scalar& min_val,
     const at::Scalar& max_val) {
   c10::musa::MUSAGuard device_guard(self.device());
+  if (!(self.scalar_type() == at::ScalarType::Float ||
+        self.scalar_type() == at::ScalarType::Half)) {
+    return at::native::hardtanh(self, min_val, max_val);
+  }
   return Unary(
       "hardtanh",
       self,
@@ -645,6 +649,10 @@ at::Tensor& HardTanh_(
     const at::Scalar& min_val,
     const at::Scalar& max_val) {
   c10::musa::MUSAGuard device_guard(self.device());
+  if (!(self.scalar_type() == at::ScalarType::Float ||
+        self.scalar_type() == at::ScalarType::Half)) {
+    return at::native::hardtanh_(self, min_val, max_val);
+  }
   Unary_(
       "hardtanh_",
       self,
@@ -662,6 +670,10 @@ at::Tensor& HardTanhOut(
     const at::Scalar& max_val,
     at::Tensor& out) {
   c10::musa::MUSAGuard device_guard(self.device());
+  if (!(self.scalar_type() == at::ScalarType::Float ||
+        self.scalar_type() == at::ScalarType::Half)) {
+    return at::native::hardtanh_out(self, min_val, max_val, out);
+  }
   out.resize_as_(self);
   UnaryOut(
       "hardtanh.out",

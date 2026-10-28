@@ -52,9 +52,6 @@ __global__ void gated_silu_kernel_vec4(
     return;
   }
 
-  const int batch_idx = vec_element_idx / hidden_size;
-  const int offset_in_batch = vec_element_idx % hidden_size;
-
   // Process up to VEC_SIZE elements
   #pragma unroll
   for (int i = 0; i < VEC_SIZE && (vec_element_idx + i) < element_num; ++i) {
@@ -77,14 +74,18 @@ void gated_silu_output(const at::Tensor& input, at::Tensor& out) {
        input.scalar_type() == at::ScalarType::BFloat16),
       "Dtype of input tensor of gated silu only support fp32 / fp16 / bf16, but now it is ",
       input.scalar_type());
+  if (input.scalar_type() == at::ScalarType::BFloat16) {
+    TORCH_CHECK(
+        at::musa::getMUSAArch() >= 220,
+        "BFloat16 gated silu requires architecture >= 220, but current is ",
+        at::musa::getMUSAArch());
+  }
   TORCH_CHECK(
       input.dim() > 1,
-      "Dim of input tensor of gated silu should greater than 1",
-      input.scalar_type());
+      "Dim of input tensor of gated silu should greater than 1");
   TORCH_CHECK(
       input.is_contiguous(),
-      "gated silu only support contiguous tensor",
-      input.scalar_type());
+      "gated silu only support contiguous tensor");
 
   int hidden_size = out.size(out.dim() - 1);
   int element_num = out.numel();
