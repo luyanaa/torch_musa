@@ -115,7 +115,17 @@ from .core.serialization import register_deserialization
 from .core import memory
 from .core.memory import *
 
-from .core._lazy_init import _lazy_init, _initialized, _is_in_bad_fork, is_initialized
+from .core import _lazy_init as _lazy_init_mod
+
+_lazy_init = _lazy_init_mod._lazy_init
+_is_in_bad_fork = _lazy_init_mod._is_in_bad_fork
+is_initialized = _lazy_init_mod.is_initialized
+
+
+def __getattr__(name):
+    if name == "_initialized":
+        return _lazy_init_mod._initialized
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from .core.random import *
 
