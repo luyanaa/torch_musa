@@ -32,56 +32,18 @@ def flash_attention_s80(
     Note:
         - Supports FP32 and FP16
         - Head dimension D must be <= 256
-        - Uses tile size 64x64 for Q/K/V
+        - Uses tile size 8x32 for Q/K/V
+        - For FP32 with D<=128: full precision (float storage)
+        - For FP32 with D>128 or FP16: mixed precision (half storage for Q/K/V)
         - Memory efficient: O(N*H*L*D) instead of O(N*H*L*S)
     """
-    # Validate inputs
-    assert query.dim() == 4, f"query must be 4D, got {query.dim()}D"
-    assert key.dim() == 4, f"key must be 4D, got {key.dim()}D"
-    assert value.dim() == 4, f"value must be 4D, got {value.dim()}D"
-
-    N, H, L, D = query.shape
-    _, _, S, D_k = key.shape
-
-    assert D == D_k, f"query and key head dim mismatch: {D} vs {D_k}"
-    assert key.shape[0] == N and key.shape[1] == H, "key batch/head mismatch"
-    assert value.shape == (N, H, S, D), "value shape mismatch"
-
-    assert D <= 256, f"Head dimension {D} > 256 not supported"
-    assert query.dtype in [torch.float32, torch.float16], \
-        f"Unsupported dtype {query.dtype}, use float32 or float16"
-
     # Ensure contiguous
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
-
-    # Default scale
-    if scale is None:
-        scale = 1.0 / (D ** 0.5)
-
-    # Call C++ implementation
-    # For now, fall back to standard SDPA with a warning
-    # TODO: Replace with actual kernel call once registered
-    import warnings
-    warnings.warn(
-        "Flash Attention S80 kernel not yet registered. "
-        "Falling back to standard SDPA (math backend). "
-        "This is a reference implementation for validation.",
-        UserWarning
-    )
-
-    # Use PyTorch's SDPA as reference
-    with torch.backends.musa.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=causal,
-            scale=scale
-        )
-
-    return output
+    
+    # Call the registered C++ operator
+    return torch.ops.aten.flash_attention_s80(query, key, value, causal, scale)
 
 
 def flash_attention_s80_reference(
@@ -106,11 +68,11 @@ def flash_attention_s80_reference(
     # Q @ K^T: [N, H, L, D] @ [N, H, D, S] -> [N, H, L, S]
     scores = torch.matmul(query, key.transpose(-2, -1)) * scale
 
-    # Apply causal mask
+    # Apply causal mask (top-left: position i can attend to j <= i)
     if causal:
         causal_mask = torch.triu(
             torch.ones(L, S, device=query.device, dtype=torch.bool),
-            diagonal=S - L + 1
+            diagonal=1
         )
         scores = scores.masked_fill(causal_mask, float('-inf'))
 
@@ -124,12 +86,3 @@ def flash_attention_s80_reference(
     output = torch.matmul(attn_weights, value)
 
     return output
-
-
-# Register as a custom op for testing
-try:
-    torch.library.define("musa::flash_attention_s80", "(Tensor q, Tensor k, Tensor v, bool causal, float? scale) -> Tensor")
-    torch.library.impl("musa::flash_attention_s80", "PrivateUse1", flash_attention_s80)
-except Exception as e:
-    # If registration fails, just use the function directly
-    pass

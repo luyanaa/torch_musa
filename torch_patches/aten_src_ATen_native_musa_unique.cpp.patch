@@ -26,6 +26,7 @@ index 0000000..2eea280
 +#include <ATen/ops/_scaled_dot_product_attention_math_musa_backward_native.h>
 +#include <ATen/ops/_scaled_dot_product_attention_flash_musa_native.h>
 +#include <ATen/ops/_scaled_dot_product_attention_flash_musa_backward_native.h>
++#include <ATen/ops/flash_attention_s80_native.h>
 +#endif
 +
 +namespace at::native {
@@ -200,6 +201,15 @@ index 0000000..2eea280
 +    int64_t ignore_index,
 +    double label_smoothing) {
 +  NYI("_fused_cross_entropy_loss_2d_backward");
++}
++
++Tensor flash_attention_s80(
++    const Tensor& query,
++    const Tensor& key,
++    const Tensor& value,
++    bool causal,
++    std::optional<double> scale) {
++  NYI("flash_attention_s80");
 +}
 +
 +} // namespace at::native

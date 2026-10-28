@@ -632,7 +632,7 @@ at::Tensor HardTanh(
   c10::musa::MUSAGuard device_guard(self.device());
   if (!(self.scalar_type() == at::ScalarType::Float ||
         self.scalar_type() == at::ScalarType::Half) ||
-      !self.is_contiguous()) {
+      !self.is_contiguous(self.suggest_memory_format())) {
     return at::native::hardtanh(self, min_val, max_val);
   }
   return Unary(
@@ -652,7 +652,7 @@ at::Tensor& HardTanh_(
   c10::musa::MUSAGuard device_guard(self.device());
   if (!(self.scalar_type() == at::ScalarType::Float ||
         self.scalar_type() == at::ScalarType::Half) ||
-      !self.is_contiguous()) {
+      !self.is_contiguous(self.suggest_memory_format())) {
     return at::native::hardtanh_(self, min_val, max_val);
   }
   Unary_(
@@ -674,7 +674,7 @@ at::Tensor& HardTanhOut(
   c10::musa::MUSAGuard device_guard(self.device());
   if (!(self.scalar_type() == at::ScalarType::Float ||
         self.scalar_type() == at::ScalarType::Half) ||
-      !self.is_contiguous()) {
+      !self.is_contiguous(self.suggest_memory_format())) {
     return at::native::hardtanh_out(self, min_val, max_val, out);
   }
   out.resize_as_(self);

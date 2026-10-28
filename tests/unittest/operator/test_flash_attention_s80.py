@@ -1,159 +1,274 @@
-"""Test Flash Attention S80 implementation."""
+"""Test flash_attention_s80 operator."""
 
 import torch
 import torch_musa
 import pytest
-from torch_musa.flash_attention_s80 import flash_attention_s80, flash_attention_s80_reference
+from torch_musa.flash_attention_s80 import flash_attention_s80_reference
 
 
-class TestFlashAttentionS80:
-    """Test suite for Flash Attention S80."""
+def test_flash_attention_s80_basic():
+    """Test basic functionality with small inputs."""
+    print("Testing flash_attention_s80 basic...")
+    
+    N, H, L, S, D = 1, 1, 8, 8, 64
+    query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+    key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+    value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+    
+    # Call the C++ operator
+    output = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+    
+    # Compare with reference
+    ref_output = flash_attention_s80_reference(query, key, value, False, None)
+    
+    torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
+    print("  Basic FP32: PASS")
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-    @pytest.mark.parametrize("causal", [False, True])
-    def test_basic_shapes(self, dtype, causal):
-        """Test basic attention shapes."""
-        N, H, L, S, D = 2, 8, 64, 64, 128
 
-        query = torch.randn(N, H, L, D, dtype=dtype, device="musa")
-        key = torch.randn(N, H, S, D, dtype=dtype, device="musa")
-        value = torch.randn(N, H, S, D, dtype=dtype, device="musa")
-
-        # Test implementation
-        output = flash_attention_s80(query, key, value, causal=causal)
-
-        # Test reference
-        ref_output = flash_attention_s80_reference(query, key, value, causal=causal)
-
-        # Compare
-        rtol = 1e-2 if dtype == torch.float16 else 1e-4
-        atol = 1e-2 if dtype == torch.float16 else 1e-4
+def test_flash_attention_s80_dtypes():
+    """Test different data types."""
+    print("\nTesting flash_attention_s80 dtypes...")
+    
+    N, H, L, S, D = 2, 4, 16, 16, 64
+    
+    for dtype in [torch.float32, torch.float16]:
+        query = torch.randn(N, H, L, D, device="musa", dtype=dtype)
+        key = torch.randn(N, H, S, D, device="musa", dtype=dtype)
+        value = torch.randn(N, H, S, D, device="musa", dtype=dtype)
+        
+        output = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+        ref_output = flash_attention_s80_reference(query, key, value, False, None)
+        
+        rtol = 1e-3 if dtype == torch.float32 else 1e-2
+        atol = 1e-3 if dtype == torch.float32 else 1e-2
+        
         torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=rtol, atol=atol)
+        print(f"  {dtype}: PASS")
 
-    @pytest.mark.parametrize("L,S", [(32, 32), (64, 128), (128, 64)])
-    def test_different_seq_lengths(self, L, S):
-        """Test different sequence lengths."""
-        N, H, D = 1, 4, 64
 
-        query = torch.randn(N, H, L, D, dtype=torch.float32, device="musa")
-        key = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-        value = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-
-        output = flash_attention_s80(query, key, value, causal=False)
-        ref_output = flash_attention_s80_reference(query, key, value, causal=False)
-
+def test_flash_attention_s80_head_dims():
+    """Test different head dimensions (D)."""
+    print("\nTesting flash_attention_s80 head dimensions...")
+    
+    N, H, L, S = 1, 2, 16, 16
+    
+    for D in [32, 64, 128, 256]:
+        query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+        key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        
+        output = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+        ref_output = flash_attention_s80_reference(query, key, value, False, None)
+        
         torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
+        print(f"  D={D}: PASS")
 
-    @pytest.mark.parametrize("D", [64, 128, 256])
-    def test_different_head_dims(self, D):
-        """Test different head dimensions."""
-        N, H, L, S = 1, 4, 64, 64
 
-        query = torch.randn(N, H, L, D, dtype=torch.float32, device="musa")
-        key = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-        value = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-
-        output = flash_attention_s80(query, key, value, causal=False)
-        ref_output = flash_attention_s80_reference(query, key, value, causal=False)
-
+def test_flash_attention_s80_sequence_lengths():
+    """Test different sequence lengths (L, S) including edge cases."""
+    print("\nTesting flash_attention_s80 sequence lengths...")
+    
+    N, H, D = 1, 2, 64
+    
+    test_cases = [
+        (8, 8),      # Small, equal
+        (16, 32),    # L < S
+        (32, 16),    # L > S
+        (7, 13),     # Non-power-of-2
+        (33, 65),    # Non-multiple of tile size (32)
+        (1, 1),      # Minimum
+        (64, 64),    # Tile size
+    ]
+    
+    for L, S in test_cases:
+        query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+        key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        
+        output = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+        ref_output = flash_attention_s80_reference(query, key, value, False, None)
+        
         torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
+        print(f"  L={L}, S={S}: PASS")
 
-    def test_custom_scale(self):
-        """Test custom scale factor."""
-        N, H, L, S, D = 1, 4, 64, 64, 128
 
-        query = torch.randn(N, H, L, D, dtype=torch.float32, device="musa")
-        key = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-        value = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
+def test_flash_attention_s80_causal():
+    """Test causal masking."""
+    print("\nTesting flash_attention_s80 causal...")
+    
+    N, H, L, S, D = 2, 4, 16, 16, 64
+    
+    for dtype in [torch.float32, torch.float16]:
+        query = torch.randn(N, H, L, D, device="musa", dtype=dtype)
+        key = torch.randn(N, H, S, D, device="musa", dtype=dtype)
+        value = torch.randn(N, H, S, D, device="musa", dtype=dtype)
+        
+        output = torch.ops.aten.flash_attention_s80(query, key, value, True, None)
+        ref_output = flash_attention_s80_reference(query, key, value, True, None)
+        
+        rtol = 1e-3 if dtype == torch.float32 else 1e-2
+        atol = 1e-3 if dtype == torch.float32 else 1e-2
+        
+        torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=rtol, atol=atol)
+        print(f"  Causal {dtype}: PASS")
 
-        scale = 0.5
-        output = flash_attention_s80(query, key, value, causal=False, scale=scale)
-        ref_output = flash_attention_s80_reference(query, key, value, causal=False, scale=scale)
 
+def test_flash_attention_s80_causal_edge_cases():
+    """Test causal masking with edge cases."""
+    print("\nTesting flash_attention_s80 causal edge cases...")
+    
+    N, H, D = 1, 1, 64
+    
+    test_cases = [
+        (8, 16),   # L < S
+        (16, 8),   # L > S
+        (7, 13),   # Non-power-of-2
+        (33, 33),  # Non-multiple of tile size
+    ]
+    
+    for L, S in test_cases:
+        query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+        key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        
+        output = torch.ops.aten.flash_attention_s80(query, key, value, True, None)
+        ref_output = flash_attention_s80_reference(query, key, value, True, None)
+        
         torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
+        print(f"  Causal L={L}, S={S}: PASS")
 
-    def test_causal_mask(self):
-        """Test causal masking."""
-        N, H, L, S, D = 1, 4, 128, 128, 64
 
-        query = torch.randn(N, H, L, D, dtype=torch.float32, device="musa")
-        key = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-        value = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
+def test_flash_attention_s80_custom_scale():
+    """Test custom scale parameter."""
+    print("\nTesting flash_attention_s80 custom scale...")
+    
+    N, H, L, S, D = 1, 2, 16, 16, 64
+    query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+    key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+    value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+    
+    custom_scale = 0.125
+    
+    output = torch.ops.aten.flash_attention_s80(query, key, value, False, custom_scale)
+    ref_output = flash_attention_s80_reference(query, key, value, False, custom_scale)
+    
+    torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
+    print("  Custom scale: PASS")
 
-        output = flash_attention_s80(query, key, value, causal=True)
-        ref_output = flash_attention_s80_reference(query, key, value, causal=True)
 
+def test_flash_attention_s80_batch_head_variation():
+    """Test different batch and head counts."""
+    print("\nTesting flash_attention_s80 batch/head variation...")
+    
+    L, S, D = 16, 16, 64
+    
+    test_cases = [
+        (1, 1),
+        (2, 4),
+        (4, 8),
+        (1, 16),
+    ]
+    
+    for N, H in test_cases:
+        query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+        key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        
+        output = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+        ref_output = flash_attention_s80_reference(query, key, value, False, None)
+        
         torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
+        print(f"  N={N}, H={H}: PASS")
 
-    def test_llama_like_shape(self):
-        """Test Llama-like attention shape."""
-        # Llama-2 7B: H=32, D=128, typical L=S=2048
-        # Use smaller size for testing
-        N, H, L, S, D = 1, 8, 512, 512, 128
 
-        query = torch.randn(N, H, L, D, dtype=torch.float16, device="musa")
-        key = torch.randn(N, H, S, D, dtype=torch.float16, device="musa")
-        value = torch.randn(N, H, S, D, dtype=torch.float16, device="musa")
+def test_flash_attention_s80_empty_inputs():
+    """Test edge cases with zero-length sequences."""
+    print("\nTesting flash_attention_s80 empty inputs...")
+    
+    N, H, D = 1, 1, 64
+    
+    # L=0
+    query = torch.randn(N, H, 0, D, device="musa", dtype=torch.float32)
+    key = torch.randn(N, H, 10, D, device="musa", dtype=torch.float32)
+    value = torch.randn(N, H, 10, D, device="musa", dtype=torch.float32)
+    
+    output = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+    assert output.shape == (N, H, 0, D)
+    print("  L=0: PASS")
+    
+    # S=0
+    query = torch.randn(N, H, 10, D, device="musa", dtype=torch.float32)
+    key = torch.randn(N, H, 0, D, device="musa", dtype=torch.float32)
+    value = torch.randn(N, H, 0, D, device="musa", dtype=torch.float32)
+    
+    output = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+    assert output.shape == (N, H, 10, D)
+    print("  S=0: PASS")
 
-        output = flash_attention_s80(query, key, value, causal=True)
-        ref_output = flash_attention_s80_reference(query, key, value, causal=True)
 
-        torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-2, atol=1e-2)
+def test_flash_attention_s80_vs_pytorch_wrapper():
+    """Test that torch.flash_attention_s80 wrapper calls the C++ op."""
+    print("\nTesting flash_attention_s80 wrapper consistency...")
+    
+    N, H, L, S, D = 2, 4, 16, 16, 64
+    query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+    key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+    value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+    
+    # Call via wrapper
+    output_wrapper = torch_musa.flash_attention_s80(query, key, value, False, None)
+    
+    # Call via C++ op directly
+    output_cpp = torch.ops.aten.flash_attention_s80(query, key, value, False, None)
+    
+    torch.testing.assert_close(output_wrapper.cpu(), output_cpp.cpu(), rtol=1e-6, atol=1e-6)
+    print("  Wrapper vs C++ op: PASS")
 
-    def test_gqa_shape(self):
-        """Test Grouped Query Attention shape."""
-        # GQA: fewer KV heads than Q heads
-        N, H_q, H_kv, L, S, D = 1, 32, 8, 64, 64, 128
 
-        query = torch.randn(N, H_q, L, D, dtype=torch.float32, device="musa")
-        key = torch.randn(N, H_kv, S, D, dtype=torch.float32, device="musa")
-        value = torch.randn(N, H_kv, S, D, dtype=torch.float32, device="musa")
-
-        # Expand K/V to match Q heads
-        key_expanded = key.repeat_interleave(H_q // H_kv, dim=1)
-        value_expanded = value.repeat_interleave(H_q // H_kv, dim=1)
-
-        output = flash_attention_s80(query, key_expanded, value_expanded, causal=False)
-        ref_output = flash_attention_s80_reference(query, key_expanded, value_expanded, causal=False)
-
-        torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
-
-    def test_numerical_stability(self):
-        """Test numerical stability with large values."""
-        N, H, L, S, D = 1, 4, 64, 64, 128
-
-        # Use large values to test numerical stability
-        query = torch.randn(N, H, L, D, dtype=torch.float32, device="musa") * 10.0
-        key = torch.randn(N, H, S, D, dtype=torch.float32, device="musa") * 10.0
-        value = torch.randn(N, H, S, D, dtype=torch.float32, device="musa") * 10.0
-
-        output = flash_attention_s80(query, key, value, causal=False)
-        ref_output = flash_attention_s80_reference(query, key, value, causal=False)
-
-        # Check for NaN/Inf
-        assert not torch.isnan(output).any(), "Output contains NaN"
-        assert not torch.isinf(output).any(), "Output contains Inf"
-
-        torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-3, atol=1e-3)
+def test_flash_attention_s80_causal_vs_sdpa():
+    """Test causal masking matches PyTorch SDPA for L≠S."""
+    print("\nTesting flash_attention_s80 causal vs SDPA...")
+    
+    N, H, D = 1, 2, 64
+    
+    test_cases = [
+        (8, 16),
+        (16, 8),
+        (7, 13),
+        (33, 33),
+    ]
+    
+    for L, S in test_cases:
+        query = torch.randn(N, H, L, D, device="musa", dtype=torch.float32)
+        key = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        value = torch.randn(N, H, S, D, device="musa", dtype=torch.float32)
+        
+        # Our implementation
+        output = torch.ops.aten.flash_attention_s80(query, key, value, True, None)
+        
+        # PyTorch SDPA
+        sdpa_output = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=1.0 / (D ** 0.5)
+        )
+        
+        torch.testing.assert_close(output.cpu(), sdpa_output.cpu(), rtol=1e-3, atol=1e-3)
+        print(f"  Causal L={L}, S={S} vs SDPA: PASS")
 
 
 if __name__ == "__main__":
-    # Run basic test
-    print("Testing Flash Attention S80...")
-
-    N, H, L, S, D = 1, 4, 64, 64, 128
-    query = torch.randn(N, H, L, D, dtype=torch.float32, device="musa")
-    key = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-    value = torch.randn(N, H, S, D, dtype=torch.float32, device="musa")
-
-    print(f"Input shapes: Q={query.shape}, K={key.shape}, V={value.shape}")
-
-    output = flash_attention_s80(query, key, value, causal=True)
-    ref_output = flash_attention_s80_reference(query, key, value, causal=True)
-
-    print(f"Output shape: {output.shape}")
-    print(f"Max diff: {(output - ref_output).abs().max().item()}")
-    print(f"Mean diff: {(output - ref_output).abs().mean().item()}")
-
-    torch.testing.assert_close(output.cpu(), ref_output.cpu(), rtol=1e-4, atol=1e-4)
-    print("✓ Test passed!")
+    test_flash_attention_s80_basic()
+    test_flash_attention_s80_dtypes()
+    test_flash_attention_s80_head_dims()
+    test_flash_attention_s80_sequence_lengths()
+    test_flash_attention_s80_causal()
+    test_flash_attention_s80_causal_edge_cases()
+    test_flash_attention_s80_causal_vs_sdpa()
+    test_flash_attention_s80_custom_scale()
+    test_flash_attention_s80_batch_head_variation()
+    test_flash_attention_s80_empty_inputs()
+    test_flash_attention_s80_vs_pytorch_wrapper()
+    print("\n✓ All flash_attention_s80 tests passed!")

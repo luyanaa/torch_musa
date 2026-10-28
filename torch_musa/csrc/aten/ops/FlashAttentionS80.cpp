@@ -2,6 +2,7 @@
 #include <ATen/NativeFunctions.h>
 #include <torch/library.h>
 
+#include "torch_musa/csrc/aten/musa/MUSAContext.h"
 #include "torch_musa/csrc/aten/ops/TensorFactory.h"
 #include "torch_musa/csrc/aten/utils/Utils.h"
 
@@ -23,11 +24,6 @@ at::Tensor FlashAttentionS80(
     const at::Tensor& V,
     bool causal,
     c10::optional<double> scale) {
-  // Architecture check: only run on S80 (CC 2.1) or compatible
-  // For now, we allow all MUSA devices but this could be restricted
-  const auto device_prop = at::musa::getCurrentDeviceProperties();
-  const auto arch = device_prop->major * 10 + device_prop->minor;
-
   // Check input dtypes - support FP32 and FP16
   TORCH_CHECK(
       Q.scalar_type() == at::ScalarType::Float ||

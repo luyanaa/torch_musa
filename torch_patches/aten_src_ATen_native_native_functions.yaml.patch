@@ -2,7 +2,7 @@ diff --git a/aten/src/ATen/native/native_functions.yaml b/aten/src/ATen/native/n
 index c7533e4..8b8d119 100644
 --- a/aten/src/ATen/native/native_functions.yaml
 +++ b/aten/src/ATen/native/native_functions.yaml
-@@ -15699,3 +15699,78 @@
+@@ -15699,3 +15699,81 @@
  # This op is ONLY used by pytorch/XLA in functionalization, and should never show up in vanilla eager mode or in any pytorch tracing contexts.
  - func: _propagate_xla_data(Tensor input, Tensor output) -> ()
    variants: function
@@ -81,3 +81,6 @@ index c7533e4..8b8d119 100644
 +  variants: function
 +  dispatch:
 +    CPU: _fused_cross_entropy_loss_2d_backward_cpu
++
++- func: flash_attention_s80(Tensor query, Tensor key, Tensor value, bool causal=False, float? scale=None) -> Tensor
++  variants: function

@@ -2,6 +2,7 @@
 
 import torch
 import torch_musa
+from torch_musa import testing
 
 
 def test_hardtanh_non_contiguous():
@@ -52,7 +53,7 @@ def test_gated_silu_shapes():
     for shape in shapes:
         # Float32
         x = torch.randn(shape, dtype=torch.float32, device="musa")
-        y = torch.ops.torch_musa.gated_silu(x)
+        y = torch.gated_silu(x)
         
         hidden = shape[-1] // 2
         x_part = x[..., :hidden]
@@ -64,7 +65,7 @@ def test_gated_silu_shapes():
         
         # Float16
         x_half = torch.randn(shape, dtype=torch.float16, device="musa")
-        y_half = torch.ops.torch_musa.gated_silu(x_half)
+        y_half = torch.gated_silu(x_half)
         
         x_part_half = x_half[..., :hidden]
         gate_half = x_half[..., hidden:]
@@ -74,10 +75,10 @@ def test_gated_silu_shapes():
         print(f"  Shape {shape} float16: PASS")
     
     # Test BF16 on arch >= 220
-    if torch_musa.testing.get_musa_arch() >= 22:
+    if testing.get_musa_arch() >= 22:
         print("  Testing BF16 (arch >= 220)...")
         x_bf16 = torch.randn(4, 128, 1536, dtype=torch.bfloat16, device="musa")
-        y_bf16 = torch.ops.torch_musa.gated_silu(x_bf16)
+        y_bf16 = torch.gated_silu(x_bf16)
         
         hidden = 768
         x_part_bf16 = x_bf16[..., :hidden]

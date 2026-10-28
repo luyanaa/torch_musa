@@ -3,6 +3,8 @@
 #include <musa_fp16.h>
 #include <musa_runtime.h>
 
+#include <cmath>
+
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
 #include "torch_musa/csrc/aten/ops/TensorFactory.h"
 #include "torch_musa/csrc/aten/utils/Utils.h"
@@ -12,193 +14,111 @@
 namespace at {
 namespace musa {
 
-// Flash Attention S80: Software-level tiled attention with online softmax
-// Designed for MTT S80 (CC 2.1) without hardware Flash Attention support
+#define FA_BR 8
+#define FA_BC 32
+#define FA_WARP_SIZE 32
+#define FA_NUM_WARPS 8
+#define FA_THREADS (FA_NUM_WARPS * FA_WARP_SIZE)
 
-#define TILE_L 64
-#define TILE_S 64
-#define MAX_THREADS 256
-#define WARP_SIZE 32
+template <typename QKV_STYPE>
+__device__ __forceinline__ int k_pad() {
+  return (sizeof(QKV_STYPE) == 2) ? 2 : 1;
+}
 
-// Online softmax state
-struct OnlineSoftmaxState {
-  float m;  // max value
-  float l;  // sum of exp
-};
+template <typename QKV_STYPE>
+__device__ __forceinline__ int k_stride(int D) {
+  return D + k_pad<QKV_STYPE>();
+}
 
-// Warp-level reduction for max
+__device__ __forceinline__ int fa_warp_id() {
+  return threadIdx.x / FA_WARP_SIZE;
+}
+
+__device__ __forceinline__ int fa_lane_id() {
+  return threadIdx.x % FA_WARP_SIZE;
+}
+
 __device__ __forceinline__ float warp_reduce_max(float val) {
-  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+  for (int offset = FA_WARP_SIZE / 2; offset > 0; offset /= 2) {
     val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
   }
   return val;
 }
 
-// Warp-level reduction for sum
 __device__ __forceinline__ float warp_reduce_sum(float val) {
-  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+  for (int offset = FA_WARP_SIZE / 2; offset > 0; offset /= 2) {
     val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
   }
   return val;
 }
 
-// Block-level reduction for max
-__device__ __forceinline__ float block_reduce_max(float val) {
-  __shared__ float shared[MAX_THREADS / WARP_SIZE];
-  int lane = threadIdx.x % WARP_SIZE;
-  int wid = threadIdx.x / WARP_SIZE;
+template <typename QKV_STYPE>
+struct SharedMemLayout {
+  QKV_STYPE* Q_smem;
+  QKV_STYPE* K_smem;
+  QKV_STYPE* V_smem;
+  float* S_smem;
+  float* O_smem;
+  float* m_smem;
+  float* l_smem;
 
-  val = warp_reduce_max(val);
-
-  if (lane == 0) shared[wid] = val;
-  __syncthreads();
-
-  if (wid == 0) {
-    val = (threadIdx.x < (MAX_THREADS / WARP_SIZE)) ? shared[lane] : -FLT_MAX;
-    val = warp_reduce_max(val);
+  static size_t total_size(int D) {
+    size_t q = FA_BR * D * sizeof(QKV_STYPE);
+    size_t k = FA_BC * (D + k_pad<QKV_STYPE>()) * sizeof(QKV_STYPE);
+    size_t v = FA_BC * D * sizeof(QKV_STYPE);
+    size_t s = FA_BR * FA_BC * sizeof(float);
+    size_t o = FA_BR * D * sizeof(float);
+    size_t ml = FA_BR * 2 * sizeof(float);
+    return q + k + v + s + o + ml;
   }
 
+  static SharedMemLayout create(char* smem, int D) {
+    SharedMemLayout layout;
+    char* ptr = smem;
+    layout.Q_smem = reinterpret_cast<QKV_STYPE*>(ptr);
+    ptr += FA_BR * D * sizeof(QKV_STYPE);
+    layout.K_smem = reinterpret_cast<QKV_STYPE*>(ptr);
+    ptr += FA_BC * (D + k_pad<QKV_STYPE>()) * sizeof(QKV_STYPE);
+    layout.V_smem = reinterpret_cast<QKV_STYPE*>(ptr);
+    ptr += FA_BC * D * sizeof(QKV_STYPE);
+    layout.S_smem = reinterpret_cast<float*>(ptr);
+    ptr += FA_BR * FA_BC * sizeof(float);
+    layout.O_smem = reinterpret_cast<float*>(ptr);
+    ptr += FA_BR * D * sizeof(float);
+    layout.m_smem = reinterpret_cast<float*>(ptr);
+    ptr += FA_BR * sizeof(float);
+    layout.l_smem = reinterpret_cast<float*>(ptr);
+    return layout;
+  }
+};
+
+__device__ __forceinline__ float load_as_float(half val) {
+  return __half2float(val);
+}
+
+__device__ __forceinline__ float load_as_float(float val) {
   return val;
 }
 
-// Block-level reduction for sum
-__device__ __forceinline__ float block_reduce_sum(float val) {
-  __shared__ float shared[MAX_THREADS / WARP_SIZE];
-  int lane = threadIdx.x % WARP_SIZE;
-  int wid = threadIdx.x / WARP_SIZE;
+template <typename QKV_STYPE>
+__device__ __forceinline__ QKV_STYPE store_qkv(float val);
 
-  val = warp_reduce_sum(val);
+template <>
+__device__ __forceinline__ half store_qkv<half>(float val) {
+  return __float2half(val);
+}
 
-  if (lane == 0) shared[wid] = val;
-  __syncthreads();
-
-  if (wid == 0) {
-    val = (threadIdx.x < (MAX_THREADS / WARP_SIZE)) ? shared[lane] : 0.0f;
-    val = warp_reduce_sum(val);
-  }
-
+template <>
+__device__ __forceinline__ float store_qkv<float>(float val) {
   return val;
 }
 
-// Compute Q @ K^T for a tile using simple matmul
-__device__ __forceinline__ void compute_qk_tile(
-    const float* Q_tile,  // [TILE_L, D]
-    const float* K_tile,  // [TILE_S, D]
-    float* S_tile,        // [TILE_L, TILE_S]
-    int D,
-    float scale) {
-  int row = threadIdx.y;
-  int col = threadIdx.x;
-
-  if (row < TILE_L && col < TILE_S) {
-    float sum = 0.0f;
-    for (int k = 0; k < D; ++k) {
-      sum += Q_tile[row * D + k] * K_tile[col * D + k];
-    }
-    S_tile[row * TILE_S + col] = sum * scale;
-  }
-}
-
-// Apply causal mask
-__device__ __forceinline__ void apply_causal_mask(
-    float* S_tile,
-    int q_idx,
-    int k_idx,
-    int TILE_S_size) {
-  int row = threadIdx.y;
-  int col = threadIdx.x;
-
-  if (row < TILE_L && col < TILE_S_size) {
-    int global_q = q_idx + row;
-    int global_k = k_idx + col;
-    if (global_k > global_q) {
-      S_tile[row * TILE_S + col] = -FLT_MAX;
-    }
-  }
-}
-
-// Online softmax update
-__device__ __forceinline__ void online_softmax_update(
-    const float* S_tile,
-    float* O_tile,        // [TILE_L, D]
-    const float* V_tile,  // [TILE_S, D]
-    float* m,             // max values [TILE_L]
-    float* l,             // sum values [TILE_L]
-    int D,
-    int TILE_S_size) {
-  int row = threadIdx.y;
-
-  if (row < TILE_L) {
-    // Find new max for this row
-    float m_new = m[row];
-    for (int col = threadIdx.x; col < TILE_S_size; col += blockDim.x) {
-      m_new = fmaxf(m_new, S_tile[row * TILE_S + col]);
-    }
-
-    // Reduce max across threads
-    __shared__ float m_shared[MAX_THREADS];
-    m_shared[threadIdx.x + threadIdx.y * blockDim.x] = m_new;
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-      m_new = -FLT_MAX;
-      for (int t = 0; t < blockDim.x; ++t) {
-        m_new = fmaxf(m_new, m_shared[t + row * blockDim.x]);
-      }
-      m_shared[row] = m_new;
-    }
-    __syncthreads();
-    m_new = m_shared[row];
-
-    // Compute exp(S - m_new) and update l
-    float l_new = 0.0f;
-    float correction = expf(m[row] - m_new);
-
-    for (int col = threadIdx.x; col < TILE_S_size; col += blockDim.x) {
-      float p = expf(S_tile[row * TILE_S + col] - m_new);
-      l_new += p;
-      S_tile[row * TILE_S + col] = p;  // Store P = exp(S - m_new)
-    }
-
-    // Reduce sum across threads
-    __shared__ float l_shared[MAX_THREADS];
-    l_shared[threadIdx.x + threadIdx.y * blockDim.x] = l_new;
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-      l_new = 0.0f;
-      for (int t = 0; t < blockDim.x; ++t) {
-        l_new += l_shared[t + row * blockDim.x];
-      }
-      l_shared[row] = l_new;
-    }
-    __syncthreads();
-    l_new = l_shared[row];
-
-    // Update l: l_new = exp(m_old - m_new) * l_old + sum(P)
-    l[row] = correction * l[row] + l_new;
-
-    // Update O: O_new = correction * O_old + P @ V
-    for (int d = threadIdx.x; d < D; d += blockDim.x) {
-      float pv = 0.0f;
-      for (int k = 0; k < TILE_S_size; ++k) {
-        pv += S_tile[row * TILE_S + k] * V_tile[k * D + d];
-      }
-      O_tile[row * D + d] = correction * O_tile[row * D + d] + pv;
-    }
-
-    // Update m
-    m[row] = m_new;
-  }
-}
-
-// Main Flash Attention kernel for S80
-template <typename T>
+template <typename T, typename QKV_STYPE>
 __global__ void flash_attention_s80_kernel(
-    const T* Q,      // [N, H, L, D]
-    const T* K,      // [N, H, S, D]
-    const T* V,      // [N, H, S, D]
-    T* O,            // [N, H, L, D]
+    const T* __restrict__ Q,
+    const T* __restrict__ K,
+    const T* __restrict__ V,
+    T* __restrict__ O,
     const float scale,
     const int N,
     const int H,
@@ -206,108 +126,170 @@ __global__ void flash_attention_s80_kernel(
     const int S,
     const int D,
     const bool causal) {
-  // Each block processes one (batch, head, tile_l) combination
-  int batch_idx = blockIdx.z;
-  int head_idx = blockIdx.y;
-  int tile_l_idx = blockIdx.x;
+  const int warp_id = fa_warp_id();
+  const int lane = fa_lane_id();
 
-  int q_start = tile_l_idx * TILE_L;
+  const int batch_idx = blockIdx.z;
+  const int head_idx = blockIdx.y;
+  const int tile_l_idx = blockIdx.x;
+
+  const int q_start = tile_l_idx * FA_BR;
   if (q_start >= L) return;
 
-  int q_end = min(q_start + TILE_L, L);
-  int actual_tile_l = q_end - q_start;
+  const int row = warp_id;
+  const int global_row = q_start + row;
 
-  // Shared memory for tiles
   extern __shared__ char smem[];
-  float* Q_tile = (float*)smem;
-  float* K_tile = Q_tile + TILE_L * D;
-  float* V_tile = K_tile + TILE_S * D;
-  float* S_tile = V_tile + TILE_S * D;
-  float* O_tile = S_tile + TILE_L * TILE_S;
-  float* m = O_tile + TILE_L * D;
-  float* l = m + TILE_L;
+  auto sm = SharedMemLayout<QKV_STYPE>::create(smem, D);
 
-  // Initialize output and state
-  int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  int total_threads = blockDim.x * blockDim.y;
-
-  for (int i = tid; i < actual_tile_l * D; i += total_threads) {
-    O_tile[i] = 0.0f;
+  for (int i = threadIdx.x; i < FA_BR; i += FA_THREADS) {
+    sm.m_smem[i] = -INFINITY;
+    sm.l_smem[i] = 0.0f;
   }
-  for (int i = tid; i < actual_tile_l; i += total_threads) {
-    m[i] = -FLT_MAX;
-    l[i] = 0.0f;
+  for (int i = threadIdx.x; i < FA_BR * D; i += FA_THREADS) {
+    sm.O_smem[i] = 0.0f;
   }
   __syncthreads();
 
-  // Load Q tile
-  const T* Q_ptr = Q + ((batch_idx * H + head_idx) * L + q_start) * D;
-  for (int i = tid; i < actual_tile_l * D; i += total_threads) {
-    Q_tile[i] = (float)Q_ptr[i];
+  const auto batch_head_q_offset =
+      (static_cast<int64_t>(batch_idx) * H + head_idx) * L * D;
+  const auto batch_head_kv_offset =
+      (static_cast<int64_t>(batch_idx) * H + head_idx) * S * D;
+
+  const int actual_br = min(FA_BR, L - q_start);
+
+  for (int i = threadIdx.x; i < actual_br * D; i += FA_THREADS) {
+    int r = i / D;
+    int d = i % D;
+    int global_r = q_start + r;
+    float val = load_as_float(Q[batch_head_q_offset + global_r * D + d]);
+    sm.Q_smem[r * D + d] = store_qkv<QKV_STYPE>(val);
   }
   __syncthreads();
 
-  // Loop over K/V tiles
-  int num_s_tiles = (S + TILE_S - 1) / TILE_S;
+  const int num_s_tiles = (S + FA_BC - 1) / FA_BC;
+
   for (int s_tile_idx = 0; s_tile_idx < num_s_tiles; ++s_tile_idx) {
-    int s_start = s_tile_idx * TILE_S;
-    int s_end = min(s_start + TILE_S, S);
-    int actual_tile_s = s_end - s_start;
+    const int s_start = s_tile_idx * FA_BC;
+    const int actual_bc = min(FA_BC, S - s_start);
 
-    // Load K tile
-    const T* K_ptr = K + ((batch_idx * H + head_idx) * S + s_start) * D;
-    for (int i = tid; i < actual_tile_s * D; i += total_threads) {
-      K_tile[i] = (float)K_ptr[i];
+    bool skip_tile = causal && (s_start > (q_start + actual_br - 1));
+
+    if (!skip_tile) {
+      const int K_STRIDE = k_stride<QKV_STYPE>(D);
+      for (int i = threadIdx.x; i < actual_bc * D; i += FA_THREADS) {
+        int r = i / D;
+        int d = i % D;
+        int global_r = s_start + r;
+        float kval = load_as_float(K[batch_head_kv_offset + global_r * D + d]);
+        float vval = load_as_float(V[batch_head_kv_offset + global_r * D + d]);
+        sm.K_smem[r * K_STRIDE + d] = store_qkv<QKV_STYPE>(kval);
+        sm.V_smem[r * D + d] = store_qkv<QKV_STYPE>(vval);
+      }
     }
     __syncthreads();
 
-    // Compute S = Q @ K^T
-    compute_qk_tile(Q_tile, K_tile, S_tile, D, scale);
-    __syncthreads();
+    if (!skip_tile && global_row < L) {
+      bool row_skip = causal && (s_start > global_row);
 
-    // Apply causal mask if needed
-    if (causal) {
-      apply_causal_mask(S_tile, q_start, s_start, actual_tile_s);
-      __syncthreads();
+      if (!row_skip) {
+        const int K_STRIDE = k_stride<QKV_STYPE>(D);
+        for (int j = lane; j < actual_bc; j += FA_WARP_SIZE) {
+          float dot = 0.0f;
+          for (int d = 0; d < D; ++d) {
+            dot += load_as_float(sm.Q_smem[row * D + d]) *
+                   load_as_float(sm.K_smem[j * K_STRIDE + d]);
+          }
+          float s_val = dot * scale;
+
+          if (causal) {
+            int global_k = s_start + j;
+            if (global_k > global_row) {
+              s_val = -INFINITY;
+            }
+          }
+
+          sm.S_smem[row * FA_BC + j] = s_val;
+        }
+        
+        __shfl_xor_sync(0xFFFFFFFF, 0, 1);
+
+        float row_max = -INFINITY;
+        for (int j = lane; j < actual_bc; j += FA_WARP_SIZE) {
+          row_max = fmaxf(row_max, sm.S_smem[row * FA_BC + j]);
+        }
+        row_max = warp_reduce_max(row_max);
+
+        float m_old = sm.m_smem[row];
+        float m_new = fmaxf(m_old, row_max);
+
+        float correction = expf(m_old - m_new);
+
+        float local_sum = 0.0f;
+        for (int j = lane; j < actual_bc; j += FA_WARP_SIZE) {
+          float p = expf(sm.S_smem[row * FA_BC + j] - m_new);
+          sm.S_smem[row * FA_BC + j] = p;
+          local_sum += p;
+        }
+        local_sum = warp_reduce_sum(local_sum);
+
+        if (lane == 0) {
+          sm.l_smem[row] = correction * sm.l_smem[row] + local_sum;
+          sm.m_smem[row] = m_new;
+        }
+
+        for (int d_base = 0; d_base < D; d_base += FA_WARP_SIZE) {
+          int d = d_base + lane;
+          if (d < D) {
+            float pv = 0.0f;
+            for (int j = 0; j < actual_bc; ++j) {
+              pv += sm.S_smem[row * FA_BC + j] *
+                    load_as_float(sm.V_smem[j * D + d]);
+            }
+            sm.O_smem[row * D + d] =
+                correction * sm.O_smem[row * D + d] + pv;
+          }
+        }
+      }
     }
-
-    // Load V tile
-    const T* V_ptr = V + ((batch_idx * H + head_idx) * S + s_start) * D;
-    for (int i = tid; i < actual_tile_s * D; i += total_threads) {
-      V_tile[i] = (float)V_ptr[i];
-    }
-    __syncthreads();
-
-    // Online softmax update
-    online_softmax_update(S_tile, O_tile, V_tile, m, l, D, actual_tile_s);
     __syncthreads();
   }
 
-  // Normalize output: O = O / l
-  for (int i = tid; i < actual_tile_l * D; i += total_threads) {
-    int row = i / D;
-    O_tile[i] = O_tile[i] / l[row];
-  }
-  __syncthreads();
-
-  // Write output
-  T* O_ptr = O + ((batch_idx * H + head_idx) * L + q_start) * D;
-  for (int i = tid; i < actual_tile_l * D; i += total_threads) {
-    O_ptr[i] = (T)O_tile[i];
+  if (global_row < L) {
+    float l_val = sm.l_smem[row];
+    if (l_val > 0.0f) {
+      for (int d_base = 0; d_base < D; d_base += FA_WARP_SIZE) {
+        int d = d_base + lane;
+        if (d < D) {
+          float out_val = sm.O_smem[row * D + d] / l_val;
+          int64_t out_idx = batch_head_q_offset + global_row * D + d;
+          O[out_idx] = static_cast<T>(out_val);
+        }
+      }
+    } else {
+      for (int d_base = 0; d_base < D; d_base += FA_WARP_SIZE) {
+        int d = d_base + lane;
+        if (d < D) {
+          int64_t out_idx = batch_head_q_offset + global_row * D + d;
+          O[out_idx] = static_cast<T>(0.0f);
+        }
+      }
+    }
   }
 }
 
-// Host function to launch Flash Attention S80 kernel
 at::Tensor flash_attention_s80_forward(
     const at::Tensor& Q,
     const at::Tensor& K,
     const at::Tensor& V,
     bool causal,
     c10::optional<double> scale_opt) {
-  // Validate inputs
   TORCH_CHECK(Q.dim() == 4, "Q must be 4D [N, H, L, D]");
   TORCH_CHECK(K.dim() == 4, "K must be 4D [N, H, S, D]");
   TORCH_CHECK(V.dim() == 4, "V must be 4D [N, H, S, D]");
+
+  TORCH_CHECK(Q.device() == K.device() && Q.device() == V.device(),
+              "Q, K, V must be on the same device");
 
   int N = Q.size(0);
   int H = Q.size(1);
@@ -317,42 +299,74 @@ at::Tensor flash_attention_s80_forward(
 
   TORCH_CHECK(K.size(0) == N && K.size(1) == H && K.size(3) == D,
               "K shape mismatch");
-  TORCH_CHECK(V.size(0) == N && V.size(1) == H && V.size(2) == S && V.size(3) == D,
+  TORCH_CHECK(V.size(0) == N && V.size(1) == H && V.size(2) == S &&
+                  V.size(3) == D,
               "V shape mismatch");
-
   TORCH_CHECK(D <= 256, "Head dimension must be <= 256");
-  TORCH_CHECK(D == K.size(3), "Q and K must have same head dimension");
+  TORCH_CHECK(D > 0, "Head dimension must be > 0");
 
-  float scale = scale_opt.has_value() ? scale_opt.value() : 1.0f / sqrtf(static_cast<float>(D));
+  float scale = scale_opt.has_value()
+                    ? static_cast<float>(scale_opt.value())
+                    : 1.0f / sqrtf(static_cast<float>(D));
 
-  // Allocate output
   auto O = at::empty({N, H, L, D}, Q.options());
 
-  // Get current device and stream
+  if (L == 0 || S == 0) {
+    O.zero_();
+    return O;
+  }
+
   int cur_device = -1;
   C10_MUSA_CHECK(musaGetDevice(&cur_device));
+  TORCH_CHECK(Q.get_device() == cur_device,
+              "Q must be on current MUSA device");
+
   const musaStream_t stream = c10::musa::getCurrentMUSAStream(cur_device);
 
-  // Calculate shared memory size
-  size_t smem_size = (TILE_L * D + TILE_S * D + TILE_S * D +
-                      TILE_L * TILE_S + TILE_L * D + TILE_L + TILE_L) * sizeof(float);
+  bool use_float_storage = (Q.scalar_type() == at::ScalarType::Float && D <= 128);
 
-  // Launch kernel
-  dim3 grid((L + TILE_L - 1) / TILE_L, H, N);
-  dim3 block(32, 8);  // 256 threads total
+  dim3 grid((L + FA_BR - 1) / FA_BR, H, N);
+  dim3 block(FA_THREADS);
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      Q.scalar_type(), "flash_attention_s80_kernel", [&] {
-        flash_attention_s80_kernel<scalar_t><<<grid, block, smem_size, stream>>>(
-            Q.data_ptr<scalar_t>(),
-            K.data_ptr<scalar_t>(),
-            V.data_ptr<scalar_t>(),
-            O.data_ptr<scalar_t>(),
-            scale,
-            N, H, L, S, D,
-            causal);
-        C10_MUSA_KERNEL_LAUNCH_CHECK();
-      });
+  if (use_float_storage) {
+    size_t smem_size = SharedMemLayout<float>::total_size(D);
+    TORCH_CHECK(smem_size <= 48 * 1024,
+                "Shared memory requirement (", smem_size,
+                " bytes) exceeds S80 limit (49152 bytes)");
+
+    AT_DISPATCH_FLOATING_TYPES(
+        Q.scalar_type(), "flash_attention_s80_kernel", [&] {
+          flash_attention_s80_kernel<scalar_t, float>
+              <<<grid, block, smem_size, stream>>>(
+                  Q.data_ptr<scalar_t>(),
+                  K.data_ptr<scalar_t>(),
+                  V.data_ptr<scalar_t>(),
+                  O.data_ptr<scalar_t>(),
+                  scale,
+                  N, H, L, S, D,
+                  causal);
+          C10_MUSA_KERNEL_LAUNCH_CHECK();
+        });
+  } else {
+    size_t smem_size = SharedMemLayout<half>::total_size(D);
+    TORCH_CHECK(smem_size <= 48 * 1024,
+                "Shared memory requirement (", smem_size,
+                " bytes) exceeds S80 limit (49152 bytes)");
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        Q.scalar_type(), "flash_attention_s80_kernel", [&] {
+          flash_attention_s80_kernel<scalar_t, half>
+              <<<grid, block, smem_size, stream>>>(
+                  Q.data_ptr<scalar_t>(),
+                  K.data_ptr<scalar_t>(),
+                  V.data_ptr<scalar_t>(),
+                  O.data_ptr<scalar_t>(),
+                  scale,
+                  N, H, L, S, D,
+                  causal);
+          C10_MUSA_KERNEL_LAUNCH_CHECK();
+        });
+  }
 
   return O;
 }

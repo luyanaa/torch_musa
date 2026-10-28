@@ -1700,6 +1700,10 @@
   dispatch:
     PrivateUse1: GatedSilu
 
+- func: flash_attention_s80
+  dispatch:
+    PrivateUse1: FlashAttentionS80
+
 - func: glu
   dispatch:
     PrivateUse1: Glu
